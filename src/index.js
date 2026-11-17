@@ -40,6 +40,11 @@
 //    checks are exactly as race-free as the state merge.
 // 4. Student draft slots are still not accepted (unchanged from the
 //    previous version) -- only mon/tue/wed/thu/fri are valid `day` values.
+// 5. (Nov 2026) POST /state also accepts a "delta" body listing only what
+//    changed, including deletions (see applyDelta). This fixes deleted,
+//    removed, and cleared items reappearing after Save. The old full-state
+//    body is still accepted, so a browser with an old copy of the app
+//    cached keeps working until it reloads.
 //
 // ENDPOINTS (unchanged from a client's point of view, except the two new
 // /lock and /unlock routes):
@@ -98,11 +103,9 @@ function isPlainObject(v) {
 
 // Merges two arrays of objects that share an id-like field. Items unique to
 // either side are kept; items present in both are merged field-by-field
-// (see mergeObjectPreferNonEmpty). This is a union, not a diff -- an item
-// deleted on one device can reappear if the other device's save still has
-// it. That trade-off is intentional: silently reviving a deleted row is a
-// minor, visible annoyance a student can just delete again; silently
-// dropping newly-entered specimen or result data is not.
+// (see mergeObjectPreferNonEmpty). This is a union, not a diff, so it can
+// never remove anything. It is now used only for full-state saves from
+// older cached copies of the app; current clients send deltas (applyDelta).
 function mergeArraysById(existingArr, incomingArr, idField) {
   const existing = Array.isArray(existingArr) ? existingArr : [];
   const incoming = Array.isArray(incomingArr) ? incomingArr : [];
@@ -173,7 +176,74 @@ function mergeTestCounter(prev, incoming) {
   return merged;
 }
 
+// --- Delta saves (current client) ---
+// The union merge above can never remove anything, so a deletion made on a
+// device was undone by its own next Save. Current clients instead send only
+// what changed since their last Save/Load:
+//   { mode: "delta",
+//     upserts: { patients:[...], orders:[...], results:[...], batches:[...] },
+//     deletes: { patients:[ids], orders:[ids], results:[ids], batches:[ids] },
+//     batchSpecimenRemovals: { <batchId>: [orderIds] },
+//     batchSpecimenAdds: { <batchId>: [orderIds] },
+//     testCounter, site, checklist (only present if it changed) }
+// Records the device did not touch are not sent at all, so an out-of-date
+// copy on one device can no longer overwrite newer work saved by another.
+// Changed records replace the stored copy whole. Batches are the one
+// exception: their specimen lists are rebuilt from the stored list, plus
+// the specimens this device added, minus the ones it removed, so two
+// devices working in the same open batch don't undo each other's changes.
+var DELTA_COLLECTIONS = ["patients", "orders", "results", "batches"];
+
+function applyDelta(existing, delta) {
+  const base = existing || {};
+  const out = { ...base };
+  const upserts = isPlainObject(delta.upserts) ? delta.upserts : {};
+  const deletes = isPlainObject(delta.deletes) ? delta.deletes : {};
+  const removals = isPlainObject(delta.batchSpecimenRemovals) ? delta.batchSpecimenRemovals : {};
+  const adds = isPlainObject(delta.batchSpecimenAdds) ? delta.batchSpecimenAdds : null;
+  for (const coll of DELTA_COLLECTIONS) {
+    const del = new Set(Array.isArray(deletes[coll]) ? deletes[coll] : []);
+    let arr = (Array.isArray(base[coll]) ? base[coll] : []).filter((x) => x && !del.has(x.id));
+    const index = new Map(arr.map((x, i) => [x.id, i]));
+    for (const item of Array.isArray(upserts[coll]) ? upserts[coll] : []) {
+      if (!item || item.id == null) continue;
+      let next = item;
+      if (coll === "batches" && index.has(item.id)) {
+        const prev = arr[index.get(item.id)];
+        const removed = new Set(Array.isArray(removals[item.id]) ? removals[item.id] : []);
+        // Start from the stored specimen list, drop what this device removed,
+        // then add only what this device added. If the client didn't say what
+        // it added (shouldn't happen), fall back to combining both lists.
+        const added = adds && Array.isArray(adds[item.id]) ? new Set(adds[item.id]) : null;
+        const incomingSpecs = (item.specimens || []).filter((s) => s && (!added || added.has(s.orderId)));
+        const specs = new Map();
+        for (const s of [...(prev.specimens || []), ...incomingSpecs]) {
+          if (s && s.orderId != null && !removed.has(s.orderId)) specs.set(s.orderId, s);
+        }
+        next = { ...item, specimens: [...specs.values()] };
+      }
+      if (index.has(item.id)) {
+        arr[index.get(item.id)] = next;
+      } else {
+        index.set(item.id, arr.length);
+        arr.push(next);
+      }
+    }
+    out[coll] = arr;
+  }
+  // A deleted order must not linger inside any batch either.
+  const deletedOrders = new Set(Array.isArray(deletes.orders) ? deletes.orders : []);
+  if (deletedOrders.size) {
+    out.batches = out.batches.map((b) => ({ ...b, specimens: (b.specimens || []).filter((s) => !deletedOrders.has(s.orderId)) }));
+  }
+  out.testCounter = mergeTestCounter(base.testCounter, delta.testCounter);
+  out.site = (delta.site !== undefined && delta.site !== null && delta.site !== "") ? delta.site : base.site;
+  if (delta.checklist !== undefined) out.checklist = delta.checklist;
+  return out;
+}
+
 function mergeState(existing, incoming) {
+  if (incoming && incoming.mode === "delta") return applyDelta(existing, incoming);
   if (!existing) return incoming;
   if (!incoming) return existing;
   return {
